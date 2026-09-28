@@ -1,0 +1,344 @@
+---
+title: "Quarto Exercise 6"
+subtitle: "Times Higher Education World University Rankings"
+author: "Xu Du"
+lang: en
+output-file: index.html
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    code-fold: show
+    code-summary: "R code"
+    code-copy: true
+    code-overflow: wrap
+    smooth-scroll: true
+execute:
+  echo: true
+  message: false
+  warning: true
+  error: false
+---
+
+
+## Data and packages
+
+The analysis uses the [CSV specified in the exercise](https://manctsui.github.io/datasets/timesData.csv). The rankings are historical records, not current rankings.
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(ggplot2)
+library(DT)
+library(plotly)
+library(crosstalk)
+library(htmltools)
+
+# Give the data download enough time on a slower connection.
+options(timeout = max(300, getOption("timeout")))
+
+times <- read.csv(
+  "https://manctsui.github.io/datasets/timesData.csv",
+  stringsAsFactors = FALSE,
+  na.strings = c("", "NA", "-"),
+  fileEncoding = "UTF-8"
+)
+
+times <- times %>%
+  mutate(
+    university_name = trimws(university_name),
+    country = trimws(country),
+    world_rank = trimws(world_rank)
+  )
+```
+
+The dataset contains `r nrow(times)` records covering `r min(times$year)` to `r max(times$year)`.
+
+## Problem 1A: Countries with the most ranking appearances
+
+The second column counts appearances across all years. A university appearing in several years is counted once for each appearance, rather than only once in total.
+
+```{r}
+#| label: country-table
+
+top_countries <- times %>%
+  count(country, name = "appearances", sort = TRUE) %>%
+  slice(1:3)
+
+DT::datatable(
+  top_countries,
+  rownames = FALSE,
+  colnames = c("Country", "Ranking appearances"),
+  selection = "none",
+  options = list(
+    dom = "t",
+    paging = FALSE,
+    order = list(list(1, "desc"))
+  )
+)
+```
+
+## Problem 1B: Bar chart
+
+```{r}
+#| label: fig-country-appearances
+#| fig-cap: "The three countries with the most appearances in the assigned ranking dataset."
+#| fig-width: 8
+#| fig-height: 4
+
+ggplot(
+  top_countries,
+  aes(x = reorder(country, appearances), y = appearances)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = "Country",
+    y = "Ranking appearances"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Problem 2A: Top 50 universities in 2011
+
+The table contains only rank and university name. Tied ranks are retained.
+
+```{r}
+#| label: top50-table
+
+top50_2011 <- times %>%
+  filter(year == 2011) %>%
+  # Keep exact ranks, optionally prefixed with an equals sign.
+  # A ranking band such as "201-225" is not an exact rank.
+  filter(grepl("^=?[0-9]+$", world_rank)) %>%
+  mutate(rank = as.numeric(sub("^=", "", world_rank))) %>%
+  filter(rank >= 1, rank <= 50) %>%
+  arrange(rank, university_name) %>%
+  select(rank, university_name)
+
+DT::datatable(
+  top50_2011,
+  rownames = FALSE,
+  colnames = c("Rank", "University name"),
+  selection = "none",
+  options = list(
+    pageLength = 10,
+    lengthMenu = c(10, 25, 50),
+    order = list(list(0, "asc"))
+  )
+)
+```
+
+There are `r nrow(top50_2011)` universities in this selection. Use the page controls to view all rows.
+
+## Problem 2B: Is rank a good key?
+
+The question refers to the result of **Problem 1A**, but that table has only country and appearance count, not a rank column. As written, `$rank` is therefore not available as a key for that table.
+
+For the university table in **Problem 2A**, rank is also not a good key because different universities can have the same rank. For example, Cambridge and Oxford are both ranked 6 in the 2011 data. A Crosstalk key must uniquely identify a row and must not be missing or empty. It should also remain stable.[^keys]
+
+The following code identifies repeated ranks in the 2011 top-50 table:
+
+```{r}
+#| label: duplicate-ranks
+
+top50_2011 %>%
+  count(rank, name = "universities") %>%
+  filter(universities > 1)
+```
+
+For this single-year table, the next section uses university name as the key and checks that it is unique and nonmissing first. For the 2016 plots, a year-and-university key identifies each observation.
+
+[^keys]: [Crosstalk documentation: keys](https://rstudio.github.io/crosstalk/using.html#keys).
+
+## Problem 2C: Filter universities by rank
+
+This repeats the two-column table from Problem 2A with a rank slider. Move either handle to change the rank interval. Reset the handles to the minimum and maximum to show all universities again.
+
+```{r}
+#| label: rank-slider
+
+# The key is stored by SharedData; it does not add a visible table column.
+stopifnot(
+  nrow(top50_2011) > 0,
+  !anyNA(top50_2011$university_name),
+  all(nzchar(top50_2011$university_name)),
+  anyDuplicated(top50_2011$university_name) == 0
+)
+
+shared_top50 <- SharedData$new(
+  top50_2011,
+  key = ~university_name,
+  group = "top50-2011"
+)
+
+htmltools::tagList(
+  filter_slider(
+    id = "rank-range-2011",
+    label = "World rank in 2011",
+    sharedData = shared_top50,
+    column = ~rank,
+    step = 1,
+    width = "100%"
+  ),
+  DT::datatable(
+    shared_top50,
+    rownames = FALSE,
+    colnames = c("Rank", "University name"),
+    selection = "none",
+    options = list(
+      pageLength = 10,
+      lengthMenu = c(10, 25, 50),
+      order = list(list(0, "asc"))
+    )
+  )
+)
+```
+
+## Problem 3: Linked scatterplots for 2016
+
+The first plot shows number of students on the horizontal axis and student-staff ratio on the vertical axis. The second shows student-staff ratio on the horizontal axis and teaching score on the vertical axis.
+
+I remove commas from student counts before converting them to numbers. To use the same observations in both plots, I retain only the 2016 rows with all three measures available. Missing values are not replaced with zero.
+
+```{r}
+#| label: prepare-2016
+
+data_2016 <- times %>%
+  filter(year == 2016) %>%
+  transmute(
+    university_name,
+    students = as.numeric(gsub(",", "", num_students)),
+    student_staff_ratio = as.numeric(student_staff_ratio),
+    teaching = as.numeric(teaching),
+    university_key = paste(year, university_name, sep = "::")
+  )
+
+plot_data <- data_2016 %>%
+  filter(
+    !is.na(students),
+    !is.na(student_staff_ratio),
+    !is.na(teaching)
+  )
+
+stopifnot(
+  nrow(plot_data) > 0,
+  !anyNA(plot_data$university_name),
+  all(nzchar(plot_data$university_name)),
+  anyDuplicated(plot_data$university_key) == 0
+)
+
+# Both plots receive the SAME SharedData object.
+shared_2016 <- SharedData$new(
+  plot_data,
+  key = ~university_key,
+  group = "universities-2016"
+)
+```
+
+Both plots use **`r nrow(plot_data)` of `r nrow(data_2016)`** 2016 records. **`r nrow(data_2016) - nrow(plot_data)`** records are excluded because at least one of the three measures is missing.
+
+```{r}
+#| label: create-student-plot
+
+p_students <- plot_ly(
+  shared_2016,
+  x = ~students,
+  y = ~student_staff_ratio,
+  text = ~paste0(
+    university_name,
+    "<br>Students: ", students,
+    "<br>Student-staff ratio: ", student_staff_ratio
+  ),
+  hoverinfo = "text",
+  type = "scatter",
+  mode = "markers",
+  marker = list(size = 6, opacity = 0.75),
+  height = 400
+) %>%
+  plotly::layout(
+    xaxis = list(title = "Number of students"),
+    yaxis = list(title = "Student-staff ratio"),
+    dragmode = "select",
+    showlegend = FALSE,
+    margin = list(l = 70, r = 15, t = 20, b = 60)
+  ) %>%
+  highlight(
+    on = "plotly_selected",
+    off = "plotly_deselect",
+    persistent = FALSE,
+    opacityDim = 0.15
+  ) %>%
+  config(displaylogo = FALSE, responsive = TRUE)
+```
+
+```{r}
+#| label: create-teaching-plot
+
+p_teaching <- plot_ly(
+  shared_2016,
+  x = ~student_staff_ratio,
+  y = ~teaching,
+  text = ~paste0(
+    university_name,
+    "<br>Student-staff ratio: ", student_staff_ratio,
+    "<br>Teaching score: ", teaching
+  ),
+  hoverinfo = "text",
+  type = "scatter",
+  mode = "markers",
+  marker = list(size = 6, opacity = 0.75),
+  height = 400
+) %>%
+  plotly::layout(
+    xaxis = list(title = "Student-staff ratio"),
+    yaxis = list(title = "Teaching score"),
+    dragmode = "select",
+    showlegend = FALSE,
+    margin = list(l = 70, r = 15, t = 20, b = 60)
+  ) %>%
+  highlight(
+    on = "plotly_selected",
+    off = "plotly_deselect",
+    persistent = FALSE,
+    opacityDim = 0.15
+  ) %>%
+  config(displaylogo = FALSE, responsive = TRUE)
+```
+
+**Interaction:** Drag a rectangle around points in either plot. The matching universities are highlighted in the other plot because the plots share the same Crosstalk keys. Double-click inside a plot while in selection mode to clear the selection.[^linking]
+
+::: {.columns}
+
+::: {.column width="50%"}
+
+### Students and student-staff ratio
+
+```{r}
+#| label: show-student-plot
+#| echo: false
+
+p_students
+```
+
+:::
+
+::: {.column width="50%"}
+
+### Student-staff ratio and teaching
+
+```{r}
+#| label: show-teaching-plot
+#| echo: false
+
+p_teaching
+```
+
+:::
+
+:::
+
+[^linking]: [Crosstalk: linked brushing](https://rstudio.github.io/crosstalk/using.html#linked-brushing) and [Plotly R: selection events](https://github.com/plotly/plotly.R/blob/master/R/highlight.R).
